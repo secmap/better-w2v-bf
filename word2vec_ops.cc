@@ -18,7 +18,7 @@ limitations under the License.
 namespace tensorflow {
 
 REGISTER_OP("SkipgramWord2vec")
-    .Output("vocab_word: string")
+    .Output("vocab_word: int32")
     .Output("vocab_freq: int32")
     .Output("words_per_epoch: int64")
     .Output("current_epoch: int32")
@@ -31,6 +31,8 @@ REGISTER_OP("SkipgramWord2vec")
     .Attr("window_size: int = 5")
     .Attr("min_count: int = 5")
     .Attr("subsample: float = 1e-3")
+    .Attr("should_sort: bool = false")
+    .Attr("num_hash_func: int")
     .Doc(R"doc(
 Parses a text file and creates a batch of examples.
 

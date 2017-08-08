@@ -23,8 +23,20 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/thread_annotations.h"
 #include "tensorflow/core/util/guarded_philox_random.h"
+#include <boost/functional/hash.hpp>
+#include <iostream>
+#include <cstdlib>
 
 namespace tensorflow {
+
+template <typename Container> // we can make this generic for any container [1]
+struct container_hash {
+    std::size_t operator()(Container const& c) const {
+        return boost::hash_range(c.begin(), c.end());
+    }
+};
+
+typedef std::vector<int32> hash_indices;
 
 // Number of examples to precalculate.
 const int kPrecalc = 3000;
@@ -33,11 +45,58 @@ const int kSentenceSize = 1000;
 
 namespace {
 
-bool ScanWord(StringPiece* input, string* word) {
+bool iscomma(char c) {
+  return c == ',';
+}
+
+bool isnewline(char c) {
+  return c == '\n';
+}
+
+bool CustomConsumeNonWhitespace(StringPiece* s, hash_indices& val, bool should_sort) {
+  const char* p = s->data();
+  const char* limit = p + s->size();
+  char int_buf[100];
+  unsigned int cur_pos = 0;
+  while (p < limit) {
+    const char c = *p;
+
+    if (iscomma(c)) {
+      int_buf[cur_pos] = '\0';
+      int32 idx = (int32)atoi(int_buf);
+      val.push_back(idx);
+      cur_pos = -1;
+    } else if (isnewline(c)) {
+      int_buf[cur_pos] = '\0';
+      int32 idx = (int32)atoi(int_buf);
+      val.push_back(idx);
+      cur_pos = -1;
+      if (should_sort) {
+        std::sort(val.begin(), val.end());
+      }
+      break;
+    } else {
+      int_buf[cur_pos] = c;
+    }
+
+    p++;
+    cur_pos++;
+  }
+  const size_t n = p - s->data();
+  if (n > 0) {
+    s->remove_prefix(n);
+    return true;
+  } else {
+    val.clear();
+    return false;
+  }
+}
+
+bool CustomScanWord(StringPiece* input, hash_indices& word, bool should_sort) {
   str_util::RemoveLeadingWhitespace(input);
-  StringPiece tmp;
-  if (str_util::ConsumeNonWhitespace(input, &tmp)) {
-    word->assign(tmp.data(), tmp.size());
+  hash_indices tmp;
+  if (CustomConsumeNonWhitespace(input, tmp, should_sort)) {
+    word.assign(tmp.begin(), tmp.end());
     return true;
   } else {
     return false;
@@ -51,12 +110,15 @@ class SkipgramWord2vecOp : public OpKernel {
   explicit SkipgramWord2vecOp(OpKernelConstruction* ctx)
       : OpKernel(ctx), rng_(&philox_) {
     string filename;
+    bool should_sort;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("filename", &filename));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("batch_size", &batch_size_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("window_size", &window_size_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("min_count", &min_count_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("subsample", &subsample_));
-    OP_REQUIRES_OK(ctx, Init(ctx->env(), filename));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("should_sort", &should_sort));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("num_hash_func", &num_hash_func_));
+    OP_REQUIRES_OK(ctx, Init(ctx->env(), filename, should_sort));
 
     mutex_lock l(mu_);
     example_pos_ = corpus_size_;
@@ -109,6 +171,7 @@ class SkipgramWord2vecOp : public OpKernel {
     int32 label;
   };
 
+  int32 num_hash_func_ = 7;
   int32 batch_size_ = 0;
   int32 window_size_ = 5;
   float subsample_ = 1e-3;
@@ -176,14 +239,19 @@ class SkipgramWord2vecOp : public OpKernel {
     *label = sentence_[label_pos_++];
   }
 
-  Status Init(Env* env, const string& filename) {
+  Status Init(Env* env, const string& filename, bool should_sort) {
+    hash_indices unk_indices;
+    for (int i = 0; i < num_hash_func_; ++i) {
+      unk_indices.push_back(0);
+    }
+
     string data;
     TF_RETURN_IF_ERROR(ReadFileToString(env, filename, &data));
     StringPiece input = data;
-    string w;
+    hash_indices w;
     corpus_size_ = 0;
-    std::unordered_map<string, int32> word_freq;
-    while (ScanWord(&input, &w)) {
+    std::unordered_map<hash_indices, int32, container_hash<hash_indices> > word_freq;
+    while (CustomScanWord(&input, w, should_sort)) {
       ++(word_freq[w]);
       ++corpus_size_;
     }
@@ -192,7 +260,7 @@ class SkipgramWord2vecOp : public OpKernel {
                                      " contains too little data: ",
                                      corpus_size_, " words");
     }
-    typedef std::pair<string, int32> WordFreq;
+    typedef std::pair<hash_indices, int32> WordFreq;
     std::vector<WordFreq> ordered;
     for (const auto& p : word_freq) {
       if (p.second >= min_count_) ordered.push_back(p);
@@ -207,16 +275,20 @@ class SkipgramWord2vecOp : public OpKernel {
                 return x.second > y.second;
               });
     vocab_size_ = static_cast<int32>(1 + ordered.size());
-    Tensor word(DT_STRING, TensorShape({vocab_size_}));
+    Tensor word(DT_INT32, TensorShape({vocab_size_, num_hash_func_}));
     Tensor freq(DT_INT32, TensorShape({vocab_size_}));
-    word.flat<string>()(0) = "UNK";
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+      word.shaped<int32, 2>({vocab_size_, num_hash_func_})(0, i) = unk_indices[i];
+    }
     static const int32 kUnkId = 0;
-    std::unordered_map<string, int32> word_id;
+    std::unordered_map<hash_indices, int32, container_hash<hash_indices> > word_id;
     int64 total_counted = 0;
     for (std::size_t i = 0; i < ordered.size(); ++i) {
       const auto& w = ordered[i].first;
       auto id = i + 1;
-      word.flat<string>()(id) = w;
+      for (std::size_t j = 0; j < num_hash_func_; ++j) {
+        word.shaped<int32, 2>({vocab_size_, num_hash_func_})(id, j) = w[j];
+      }
       auto word_count = ordered[i].second;
       freq.flat<int32>()(id) = word_count;
       total_counted += word_count;
@@ -227,7 +299,7 @@ class SkipgramWord2vecOp : public OpKernel {
     freq_ = freq;
     corpus_.reserve(corpus_size_);
     input = data;
-    while (ScanWord(&input, &w)) {
+    while (CustomScanWord(&input, w, should_sort)) {
       corpus_.push_back(gtl::FindWithDefault(word_id, w, kUnkId));
     }
     precalc_examples_.resize(kPrecalc);
