@@ -206,6 +206,90 @@ class Word2Vec(object):
     print("Skipped: ", questions_skipped)
     self._analogy_questions = np.array(questions, dtype=np.int32)
 
+
+  def forward_seperately(self, examples, labels):
+    """Build the graph for the forward pass."""
+    opts = self._options
+
+    # Declare all variables we need.
+    # Embedding: [vocab_size, emb_dim]
+    init_width = 0.5 / opts.emb_dim
+    emb = tf.Variable(
+        tf.random_uniform(
+            [opts.hash_func_max, opts.emb_dim], -init_width, init_width),
+        name="emb")
+    self._emb = emb
+
+    # Softmax weight: [vocab_size, emb_dim]. Transposed.
+    sm_w_t = tf.Variable(
+        tf.zeros([opts.hash_func_max, opts.emb_dim]),
+        name="sm_w_t")
+
+    # Softmax bias: [vocab_size].
+    sm_b = tf.Variable(tf.zeros([opts.hash_func_max]), name="sm_b")
+
+    # Global step: scalar, i.e., shape [].
+    self.global_step = tf.Variable(0, name="global_step")
+
+    # Nodes to compute the nce loss w/ candidate sampling.
+    labels_matrix = tf.reshape(
+        tf.cast(labels,
+                dtype=tf.int64),
+        [opts.batch_size, 1])
+
+    # Negative sampling.
+    sampled_ids, _, _ = (tf.nn.fixed_unigram_candidate_sampler(
+        true_classes=labels_matrix,
+        num_true=1,
+        num_sampled=opts.num_samples,
+        unique=True,
+        range_max=opts.vocab_size,
+        distortion=0.75,
+        unigrams=opts.vocab_counts.tolist()))
+
+    sampled_ids_indices = tf.nn.embedding_lookup(self._id2word, sampled_ids)
+    # Embeddings for examples: [batch_size, emb_dim]
+    example_indices = tf.nn.embedding_lookup(self._id2word, examples)
+    example_emb = self.get_bf_embs(example_indices)
+    
+    example_emb_tiled = tf.tile(example_emb, [1, opts.num_hash_func])
+    example_emb_tiled = tf.reshape(example_emb_tiled, [-1, opts.emb_dim])
+    # If the labels is a list of int
+    labels_indices = tf.nn.embedding_lookup(self._id2word, labels)
+    # Else the labels is a list of indices
+
+    # Weights for true_w: [batch_size, num_hash_func, emb_dim]
+    true_w = tf.nn.embedding_lookup(sm_w_t, labels_indices)
+    # Weights for true_w_reshaped: [batch_size * num_hash_func, emb_dim]
+    true_w_reshaped = tf.reshape(true_w, [-1, opts.emb_dim])
+    
+    # Biases for true_b: [batch_size, num_hash_func, 1]
+    true_b = tf.nn.embedding_lookup(sm_b, labels_indices)
+    # Biases for true_b_reshaped: [batch_size * num_hash_func, 1]
+    true_b_reshaped = tf.reshape(true_b, [-1])
+
+    # Weights for sampled ids: [num_sampled, num_hash_func, emb_dim]
+    sampled_w = tf.nn.embedding_lookup(sm_w_t, sampled_ids_indices)
+    # Weights for sampled_w_reshaped: [num_sampled * num_hash_func, emb_dim]
+    sampled_w_reshaped = tf.reshape(sampled_w, [-1, opts.emb_dim])
+    # Biases for sampled ids: [num_sampled, num_hash_func, 1]
+    sampled_b = tf.nn.embedding_lookup(sm_b, sampled_ids_indices)
+    # Weights for sampled_b_reshaped: [num_sampled * num_hash_func]
+    sampled_b_reshaped = tf.reshape(sampled_b, [-1])
+
+    # True logits: [batch_size, 1]
+    true_logits = tf.reduce_sum(tf.multiply(example_emb_tiled, true_w_reshaped), 1) + true_b_reshaped 
+    # Sampled logits: [batch_size, num_sampled]
+    # We replicate sampled noise labels for all examples in the batch
+    # using the matmul.
+    
+    # sampled_logits: [batch_size, emb_dim] * [num_sampled * num_hash_func, emb_dim]
+    # = [batch_size, num_sampled * num_hash_func]
+    sampled_logits = tf.matmul(example_emb,
+                               sampled_w_reshaped,
+                               transpose_b=True) + sampled_b_reshaped
+    return true_logits, sampled_logits
+
   def forward(self, examples, labels):
     """Build the graph for the forward pass."""
     opts = self._options
@@ -404,7 +488,7 @@ class Word2Vec(object):
     self._id2word = opts.vocab_words
     for i, w in enumerate(self._id2word):
       self._word2id[tuple(w)] = i
-    true_logits, sampled_logits = self.forward(examples, labels)
+    true_logits, sampled_logits = self.forward_seperately(examples, labels)
     loss = self.nce_loss(true_logits, sampled_logits)
     tf.summary.scalar("NCE loss", loss)
     self._loss = loss
