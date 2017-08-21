@@ -369,6 +369,52 @@ class Word2Vec(object):
                                transpose_b=True) + sampled_b_vec
     return true_logits, sampled_logits
 
+
+  def forward_full(self, examples, labels):
+    """Build the graph for the forward pass."""
+    opts = self._options
+
+    # Declare all variables we need.
+    # Embedding: [vocab_size, emb_dim]
+    init_width = 0.5 / opts.emb_dim
+    emb = tf.Variable(
+        tf.random_uniform(
+            [opts.hash_func_max, opts.emb_dim], -init_width, init_width),
+        name="emb")
+    self._emb = emb
+
+    # Softmax weight: [vocab_size, emb_dim]. Transposed.
+    sm_w_t = tf.Variable(
+        tf.zeros([opts.hash_func_max, opts.emb_dim]),
+        name="sm_w_t")
+
+    # Softmax bias: [vocab_size].
+    sm_b = tf.Variable(tf.zeros([opts.hash_func_max]), name="sm_b")
+
+    # Global step: scalar, i.e., shape [].
+    self.global_step = tf.Variable(0, name="global_step")
+
+    # Nodes to compute the nce loss w/ candidate sampling.
+    labels_matrix = tf.reshape(
+        tf.cast(labels,
+                dtype=tf.int64),
+        [opts.batch_size, 1])
+
+
+    example_indices = tf.nn.embedding_lookup(self._id2word, examples)
+    example_emb = self.get_bf_embs(example_indices)
+    
+    logits = tf.matmul(example_emb, sm_w_t, transpose_b=True) + sm_b
+    
+    # The labels is a list of int
+    labels_indices = tf.nn.embedding_lookup(self._id2word, labels)
+    labels_ground_truth = tf.clip_by_value(
+                            tf.reduce_sum(tf.one_hot(labels_indices, opts.hash_func_max), 1),
+                            0, 1)
+
+    return logits, labels_ground_truth
+
+
   def nce_loss(self, true_logits, sampled_logits):
     """Build the graph for the NCE loss."""
 
@@ -494,6 +540,46 @@ class Word2Vec(object):
     true_logits, sampled_logits = self.forward_seperately(examples, labels)
     loss = self.nce_loss(true_logits, sampled_logits)
     tf.summary.scalar("NCE loss", loss)
+    self._loss = loss
+    self.optimize(loss)
+
+    # Properly initialize all variables.
+    tf.global_variables_initializer().run()
+
+    self.saver = tf.train.Saver()
+
+  def build_graph_full(self, should_sort):
+    """Build the graph for the full model."""
+    opts = self._options
+    # The training data. A text file.
+    (words, counts, words_per_epoch, self._epoch, self._words, examples,
+     labels) = word2vec.skipgram_word2vec(filename=opts.train_data,
+                                          batch_size=opts.batch_size,
+                                          window_size=opts.window_size,
+                                          min_count=opts.min_count,
+                                          subsample=opts.subsample,
+                                          should_sort=should_sort,
+                                          num_hash_func=opts.num_hash_func)
+    (opts.vocab_words, opts.vocab_counts,
+     opts.words_per_epoch) = self._session.run([words, counts, words_per_epoch])
+    opts.vocab_size = len(opts.vocab_words)
+    print("Data file: ", opts.train_data)
+    print("Vocab size: ", opts.vocab_size - 1, " + UNK")
+    print("Words per epoch: ", opts.words_per_epoch)
+    self._examples = examples
+    self._labels = labels
+    self._id2word = opts.vocab_words
+    for i, w in enumerate(self._id2word):
+      self._word2id[tuple(w)] = i
+    logits, labels = self.forward(examples, labels)
+    
+    # cross-entropy(logits, labels)
+    ent = tf.nn.sigmoid_cross_entropy_with_logits(
+        labels=labels, logits=logits)
+
+    loss = tf.reduce_sum(ent) / opts.batch_size
+
+    tf.summary.scalar("Loss", loss)
     self._loss = loss
     self.optimize(loss)
 
