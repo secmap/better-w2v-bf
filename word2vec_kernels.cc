@@ -53,24 +53,41 @@ bool isnewline(char c) {
   return c == '\n';
 }
 
-bool CustomConsumeNonWhitespace(StringPiece* s, hash_indices& val, bool should_sort) {
+bool CustomConsumeNonWhitespace(StringPiece* s, hash_indices& val, bool should_sort, int32 num_hash_func_) {
   const char* p = s->data();
   const char* limit = p + s->size();
   char int_buf[100];
   unsigned int cur_pos = 0;
+  int cur_hash_func = 0; //from 0 ~ num_hash_func-1
   while (p < limit) {
     const char c = *p;
 
-    if (iscomma(c)) {
+    if(cur_hash_func >= num_hash_func_){
+      if(isnewline(c)){
+        cur_hash_func = 0;
+        if (should_sort) {
+          std::sort(val.begin(), val.end());
+        }
+        break;
+      }
+      else {
+        p++;
+        continue;
+      }
+    }
+    else if (iscomma(c)) {
       int_buf[cur_pos] = '\0';
       int32 idx = (int32)atoi(int_buf);
       val.push_back(idx);
+      cur_hash_func++;
       cur_pos = -1;
     } else if (isnewline(c)) {
       int_buf[cur_pos] = '\0';
       int32 idx = (int32)atoi(int_buf);
       val.push_back(idx);
+      cur_hash_func++;
       cur_pos = -1;
+      cur_hash_func = 0;
       if (should_sort) {
         std::sort(val.begin(), val.end());
       }
@@ -92,10 +109,10 @@ bool CustomConsumeNonWhitespace(StringPiece* s, hash_indices& val, bool should_s
   }
 }
 
-bool CustomScanWord(StringPiece* input, hash_indices& word, bool should_sort) {
+bool CustomScanWord(StringPiece* input, hash_indices& word, bool should_sort, int32 num_hash_func_) {
   str_util::RemoveLeadingWhitespace(input);
   hash_indices tmp;
-  if (CustomConsumeNonWhitespace(input, tmp, should_sort)) {
+  if (CustomConsumeNonWhitespace(input, tmp, should_sort, num_hash_func_)) {
     word.assign(tmp.begin(), tmp.end());
     return true;
   } else {
@@ -251,7 +268,7 @@ class SkipgramWord2vecOp : public OpKernel {
     hash_indices w;
     corpus_size_ = 0;
     std::unordered_map<hash_indices, int32, container_hash<hash_indices> > word_freq;
-    while (CustomScanWord(&input, w, should_sort)) {
+    while (CustomScanWord(&input, w, should_sort, num_hash_func_)) {
       ++(word_freq[w]);
       ++corpus_size_;
     }
@@ -299,7 +316,7 @@ class SkipgramWord2vecOp : public OpKernel {
     freq_ = freq;
     corpus_.reserve(corpus_size_);
     input = data;
-    while (CustomScanWord(&input, w, should_sort)) {
+    while (CustomScanWord(&input, w, should_sort, num_hash_func_)) {
       corpus_.push_back(gtl::FindWithDefault(word_id, w, kUnkId));
     }
     precalc_examples_.resize(kPrecalc);
