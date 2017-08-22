@@ -42,6 +42,7 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 import numpy as np
 import tensorflow as tf
 from bf import bloomfilter
+import pickle
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="2"
@@ -195,19 +196,13 @@ class Word2Vec(object):
     questions = []
     questions_skipped = 0
     with open(self._options.eval_data, "rb") as analogy_f:
-      for line in analogy_f:
-        if line.startswith(b":"):  # Skip comments.
-          continue
-        words = line.strip().lower().split(b" ")
-        ids = [self._word2id.get(w.strip()) for w in words]
-        if None in ids or len(ids) != 4:
-          questions_skipped += 1
-        else:
-          questions.append(np.array(ids))
+      questions = np.array(pickle.load(analogy_f))
+
+
     print("Eval analogy file: ", self._options.eval_data)
     print("Questions: ", len(questions))
-    print("Skipped: ", questions_skipped)
-    self._analogy_questions = np.array(questions, dtype=np.int32)
+    # print("Skipped: ", questions_skipped)
+    self._analogy_questions = questions
 
 
   def forward_seperately(self, examples, labels):
@@ -464,18 +459,18 @@ class Word2Vec(object):
     # The eval feeds three vectors of word ids for a, b, c, each of
     # which is of size N, where N is the number of analogies we want to
     # evaluate in one batch.
-    analogy_a = tf.placeholder(dtype=tf.int32)  # [num_hash_func]
-    analogy_b = tf.placeholder(dtype=tf.int32)  # [num_hash_func]
-    analogy_c = tf.placeholder(dtype=tf.int32)  # [num_hash_func]
+    analogy_a = tf.placeholder(dtype=tf.int32)  # [N, num_hash_func]
+    analogy_b = tf.placeholder(dtype=tf.int32)  # [N, num_hash_func]
+    analogy_c = tf.placeholder(dtype=tf.int32)  # [N, num_hash_func]
 
     # Normalized word embeddings of shape [vocab_size, emb_dim].
     nemb = tf.nn.l2_normalize(self._emb, 1)
 
     # Each row of a_emb, b_emb, c_emb is a word's embedding vector.
     # They all have the shape [N, emb_dim]
-    a_emb = self.get_bf_embs([analogy_a])  # a's embs
-    b_emb = self.get_bf_embs([analogy_b])  # b's embs
-    c_emb = self.get_bf_embs([analogy_c])  # c's embs
+    a_emb = self.get_bf_embs(analogy_a)  # a's embs
+    b_emb = self.get_bf_embs(analogy_b)  # b's embs
+    c_emb = self.get_bf_embs(analogy_c)  # c's embs
 
     # We expect that d's embedding vectors on the unit hyper-sphere is
     # near: c_emb + (b_emb - a_emb), which has the shape [N, emb_dim].
@@ -491,13 +486,13 @@ class Word2Vec(object):
     nearby_emb = nearby_emb / norm
 
     all_words_emb = self.get_bf_embs(self._id2word)
+    print('all_words_emb.shape = ', all_words_emb.shape)
     norm = tf.sqrt(tf.reduce_sum(tf.square(all_words_emb), 1, keep_dims=True))
     all_words_emb = all_words_emb / norm
     
     nearby_dist = tf.matmul(nearby_emb, all_words_emb, transpose_b=True)
     nearby_val, nearby_idx = tf.nn.top_k(nearby_dist,
                                          min(1000, self._options.vocab_size))
-
 
     # Compute cosine distance between each pair of target and vocab.
     dist = tf.matmul(target, all_words_emb, transpose_b=True)
@@ -650,9 +645,9 @@ class Word2Vec(object):
   def _predict(self, analogy):
     """Predict the top 4 answers for analogy questions."""
     idx, = self._session.run([self._analogy_pred_idx], {
-        self._analogy_a: analogy[0],
-        self._analogy_b: analogy[1],
-        self._analogy_c: analogy[2]
+        self._analogy_a: analogy[:, 0],
+        self._analogy_b: analogy[:, 1],
+        self._analogy_c: analogy[:, 2]
     })
     return idx
 
@@ -672,19 +667,23 @@ class Word2Vec(object):
       limit = start + 2500
       sub = self._analogy_questions[start:limit, :]
       idx = self._predict(sub)
+      nearby_words = tf.nn.embedding_lookup(self._id2word, idx)
       start = limit
+      
       for question in xrange(sub.shape[0]):
         for j in xrange(4):
-          if idx[question, j] == sub[question, 3]:
+          if nearby_words[question, j] == sub[question, 3]:
             # Bingo! We predicted correctly. E.g., [italy, rome, france, paris].
             correct += 1
             break
-          elif idx[question, j] in sub[question, :3]:
+          elif nearby_words[question, j] in sub[question, :3]:
             # We need to skip words already in the question.
             continue
           else:
             # The correct label is not the precision@1
-            break
+            # We only care about if the word inside the top k similarest words
+            # If not the answer word or question words, we just pass
+            continue
     print()
     print("Eval %4d/%d accuracy = %4.1f%%" % (correct, total,
                                               correct * 100.0 / total))
@@ -692,7 +691,7 @@ class Word2Vec(object):
 
   def analogy(self, w0, w1, w2):
     """Predict word w3 as in w0:w1 vs w2:w3."""
-    wid = np.array([self._bf.get_indices(w) for w in [w0, w1, w2]])
+    wid = np.array([[self._bf.get_indices(w) for w in [w0, w1, w2]]])
     idx = self._predict(wid)
     found = False
     for c in [self._id2word[i] for i in idx[0, :]]:
@@ -701,7 +700,6 @@ class Word2Vec(object):
       if possible_word not in [w0, w1, w2]:
         print(possible_word)
         found = True
-        break
     if not found:
       print('Cannot find analogy with [{}, {}, {}].'.format(w0, w1, w2))
 
@@ -750,7 +748,11 @@ def main(_):
       bf = bloomfilter()
       bf.load(opts.plk_table)
 
-    if FLAGS.interactive and opts.plk_table and opts.restore_model:
+    if FLAGS.interactive:
+      if not opts.plk_table or not opts.restore_model:
+        print('--plk_table and --restore_model options should be set.')
+        sys.exit(-2)
+
       with tf.device("/cpu:0"):
         model = Word2Vec(opts, session, False, bf)
         model.saver.restore(session, tf.train.latest_checkpoint(opts.save_path))
@@ -759,11 +761,12 @@ def main(_):
     else:
       with tf.device("/cpu:0"):
         model = Word2Vec(opts, session, True, bf)
+        model.read_analogies()
       if opts.restore_model:
         model.saver.restore(session, tf.train.latest_checkpoint(opts.save_path))
       for _ in xrange(opts.epochs_to_train):
         model.train()  # Process one epoch
-        # model.eval()  # Eval analogies.
+        model.eval()  # Eval analogies.
       # Perform a final save.
       model.saver.save(session,
                       os.path.join(opts.save_path, "model.ckpt"),
