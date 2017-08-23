@@ -85,7 +85,6 @@ bool CustomConsumeNonWhitespace(StringPiece* s, hash_indices& val, bool should_s
       int_buf[cur_pos] = '\0';
       int32 idx = (int32)atoi(int_buf);
       val.push_back(idx);
-      cur_hash_func++;
       cur_pos = -1;
       cur_hash_func = 0;
       if (should_sort) {
