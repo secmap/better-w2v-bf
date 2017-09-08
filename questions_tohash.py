@@ -16,11 +16,11 @@ if __name__ == '__main__':
         for line in f:
             if line.startswith(': '):
                 continue
-            words = line.strip().split()
+            words = [w.lower() for w in line.strip().split()]
             question = []
             for word in words:
                 indices = bf.get_indices(word)
-                question.append(indices)
+                question.append(sorted(indices))
             questions.append(question)
         pickle.dump(questions, out_f, protocol=2)
     out_f.close()
