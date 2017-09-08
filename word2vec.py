@@ -198,7 +198,6 @@ class Word2Vec(object):
     with open(self._options.eval_data, "rb") as analogy_f:
       questions = np.array(pickle.load(analogy_f))
 
-
     print("Eval analogy file: ", self._options.eval_data)
     print("Questions: ", len(questions))
     # print("Skipped: ", questions_skipped)
@@ -656,37 +655,42 @@ class Word2Vec(object):
 
     # How many questions we get right at precision@1.
     correct = 0
-
+    unknown_words = []
     try:
       total = self._analogy_questions.shape[0]
     except AttributeError as e:
       raise AttributeError("Need to read analogy questions.")
-
     start = 0
     while start < total:
       limit = start + 2500
       sub = self._analogy_questions[start:limit, :]
       idx = self._predict(sub)
-      nearby_words = tf.nn.embedding_lookup(self._id2word, idx)
       start = limit
       
+      count = 0
       for question in xrange(sub.shape[0]):
         for j in xrange(4):
-          if nearby_words[question, j] == sub[question, 3]:
-            # Bingo! We predicted correctly. E.g., [italy, rome, france, paris].
-            correct += 1
-            break
-          elif nearby_words[question, j] in sub[question, :3]:
-            # We need to skip words already in the question.
+          try:
+            if self._word2id[tuple(sub[question, 3])] in idx[question]:
+              correct += 1
+              break
+            else:
+              continue
+          except KeyError:
+            # print('Unable to find words in question {}'.format(start - 2500 + question))
+            unknown_words.append(start - 2500 + question)
             continue
-          else:
-            # The correct label is not the precision@1
-            # We only care about if the word inside the top k similarest words
-            # If not the answer word or question words, we just pass
-            continue
-    print()
+        count += 1
+
+    ### For debug print out unknown_words ###
+    # lines = [l for l in open('questions-words.txt', 'r').readlines() if not l.startswith(':')]
+    # for w in unknown_words:
+    #     print(lines[w])
+        
+
     print("Eval %4d/%d accuracy = %4.1f%%" % (correct, total,
                                               correct * 100.0 / total))
+    print('-------------------------------------------------------')
 
 
   def analogy(self, w0, w1, w2):
